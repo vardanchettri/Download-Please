@@ -163,6 +163,219 @@ st.markdown(
 
 
 # ============================================================
+# HELPERS
+# ============================================================
+
+MIME_TYPES = {
+    ".mp4": "video/mp4",
+    ".mkv": "video/x-matroska",
+    ".webm": "video/webm",
+    ".mp3": "audio/mpeg",
+    ".m4a": "audio/mp4",
+    ".wav": "audio/wav",
+}
+
+# YouTube returns 403 for some player clients depending on the server IP
+# and the moment. We try several clients one after the other.
+CLIENT_STRATEGIES = [
+    None,                          # yt-dlp default
+    ["tv", "web_safari"],
+    ["android_vr"],
+    ["ios"],
+    ["mweb"],
+]
+
+
+@st.cache_resource(show_spinner=False)
+def find_ffmpeg():
+    """Return the path to an ffmpeg binary, or None."""
+    path = shutil.which("ffmpeg")
+    if path:
+        return path
+
+    # Fallback: ffmpeg bundled in the pip package "imageio-ffmpeg"
+    try:
+        import imageio_ffmpeg
+
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return None
+
+
+def find_js_runtime():
+    """yt-dlp needs a JS runtime (deno or node) to solve YouTube challenges."""
+    runtimes = {}
+
+    deno = shutil.which("deno")
+    if deno:
+        runtimes["deno"] = {"path": deno}
+
+    node = shutil.which("node")
+    if node:
+        runtimes["node"] = {"path": node}
+
+    return runtimes
+
+
+def build_format_selector(media_type, quality, output_format):
+    if media_type == "Audio":
+        return "bestaudio/best"
+
+    h = ""
+    if quality != "Best available":
+        h = f"[height<={int(quality.replace('p', ''))}]"
+
+    if output_format == "MP4":
+        return (
+            f"bestvideo{h}[ext=mp4]+bestaudio[ext=m4a]/"
+            f"bestvideo{h}+bestaudio/"
+            f"best{h}[ext=mp4]/"
+            f"best{h}/best"
+        )
+
+    if output_format == "WEBM":
+        return (
+            f"bestvideo{h}[ext=webm]+bestaudio[ext=webm]/"
+            f"bestvideo{h}+bestaudio/"
+            f"best{h}[ext=webm]/"
+            f"best{h}/best"
+        )
+
+    return f"bestvideo{h}+bestaudio/best{h}/best"
+
+
+def build_ydl_opts(
+    *,
+    media_type,
+    quality,
+    output_format,
+    audio_format,
+    temp_dir,
+    ffmpeg_path,
+    cookies_path,
+    clients,
+    progress_hook,
+):
+    opts = {
+        "format": build_format_selector(media_type, quality, output_format),
+        "outtmpl": os.path.join(temp_dir, "%(title).150B [%(id)s].%(ext)s"),
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "noprogress": True,
+        "restrictfilenames": True,
+        "windowsfilenames": True,
+        "overwrites": True,
+        "progress_hooks": [progress_hook],
+        # Network robustness (helps against 403 / throttling)
+        "retries": 10,
+        "fragment_retries": 10,
+        "file_access_retries": 5,
+        "extractor_retries": 3,
+        "socket_timeout": 30,
+        "concurrent_fragment_downloads": 4,
+        "http_chunk_size": 10 * 1024 * 1024,
+        "geo_bypass": True,
+        "nocheckcertificate": False,
+        # Let yt-dlp fetch the YouTube challenge solver if it is missing
+        "remote_components": ["ejs:github"],
+    }
+
+    js_runtimes = find_js_runtime()
+    if js_runtimes:
+        opts["js_runtimes"] = js_runtimes
+
+    if ffmpeg_path:
+        opts["ffmpeg_location"] = ffmpeg_path
+
+    if cookies_path:
+        opts["cookiefile"] = cookies_path
+
+    if clients:
+        opts["extractor_args"] = {"youtube": {"player_client": clients}}
+
+    if media_type == "Video":
+        opts["merge_output_format"] = output_format.lower()
+    else:
+        opts["postprocessors"] = [
+            {
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": audio_format.lower(),
+                "preferredquality": "192",
+            }
+        ]
+
+    return opts
+
+
+def clear_dir(path):
+    for p in Path(path).iterdir():
+        try:
+            if p.is_dir():
+                shutil.rmtree(p, ignore_errors=True)
+            else:
+                p.unlink()
+        except Exception:
+            pass
+
+
+def pick_output_file(temp_dir, wanted_ext):
+    files = [
+        p
+        for p in Path(temp_dir).iterdir()
+        if p.is_file()
+        and not p.name.endswith((".part", ".ytdl", ".temp", ".txt"))
+        and p.stat().st_size > 0
+    ]
+
+    if not files:
+        return None
+
+    preferred = [p for p in files if p.suffix.lower() == wanted_ext]
+    pool = preferred or files
+    return max(pool, key=lambda p: p.stat().st_size)
+
+
+def friendly_error(message):
+    low = message.lower()
+
+    if "ffmpeg" in low or "ffprobe" in low:
+        return (
+            "ffmpeg is not available on the server.\n\n"
+            "Make sure packages.txt contains the line 'ffmpeg' "
+            "and requirements.txt contains 'imageio-ffmpeg', "
+            "then reboot the app."
+        )
+
+    if "sign in to confirm" in low or "not a bot" in low:
+        return (
+            "YouTube is asking this server to prove it is not a bot "
+            "(this happens a lot on cloud hosting IPs).\n\n"
+            "Fix: upload a cookies.txt file in the 'Advanced' section "
+            "above and try again."
+        )
+
+    if "403" in low or "forbidden" in low:
+        return (
+            "YouTube refused the download (HTTP 403) with every method "
+            "that was tried.\n\n"
+            "Fixes: reboot the app so the latest yt-dlp is installed, "
+            "or upload a cookies.txt file in the 'Advanced' section."
+        )
+
+    if "private video" in low or "members-only" in low:
+        return "This video is private or members-only."
+
+    if "video unavailable" in low or "not available" in low:
+        return "This video is unavailable (removed, private or region-locked)."
+
+    if "unsupported url" in low:
+        return "This URL is not supported. Please paste a valid YouTube link."
+
+    return None
+
+
+# ============================================================
 # HEADER
 # ============================================================
 
@@ -199,6 +412,10 @@ media_type = st.radio(
 # OPTIONS
 # ============================================================
 
+quality = "Best available"
+output_format = "MP4"
+audio_format = "MP3"
+
 if media_type == "Video":
 
     quality = st.selectbox(
@@ -224,6 +441,16 @@ else:
         ["MP3", "M4A", "WAV"],
     )
 
+with st.expander("Advanced (optional)"):
+    cookies_file = st.file_uploader(
+        "cookies.txt (Netscape format)",
+        type=["txt"],
+        help=(
+            "Only needed if YouTube blocks the server with a 403 or "
+            "'confirm you're not a bot' error."
+        ),
+    )
+
 
 # ============================================================
 # NOTICE
@@ -246,328 +473,191 @@ st.write("")
 
 if st.button("Download", type="primary"):
 
+    st.session_state.pop("result", None)
+
     if not url.strip():
         st.error("Please enter a YouTube URL.")
         st.stop()
 
-    temp_dir = tempfile.mkdtemp(
-        prefix="yt_download_"
-    )
+    ffmpeg_path = find_ffmpeg()
 
-    output_template = os.path.join(
-        temp_dir,
-        "%(title).180s.%(ext)s"
-    )
+    needs_ffmpeg = media_type == "Audio" or True  # merging also needs it
+    if needs_ffmpeg and not ffmpeg_path:
+        st.error("ffmpeg was not found on the server.")
+        st.code(
+            "1) packages.txt  ->  ffmpeg\n"
+            "2) requirements.txt  ->  imageio-ffmpeg\n"
+            "Then reboot the app."
+        )
+        st.stop()
+
+    temp_dir = tempfile.mkdtemp(prefix="yt_download_")
 
     try:
-
         progress = st.progress(0)
         status = st.empty()
 
-        # ====================================================
-        # VIDEO
-        # ====================================================
-
-        if media_type == "Video":
-
-            if quality == "Best available":
-
-                if output_format == "MP4":
-
-                    format_selector = (
-                        "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
-                        "best[ext=mp4]/"
-                        "bestvideo+bestaudio/best"
-                    )
-
-                elif output_format == "WEBM":
-
-                    format_selector = (
-                        "bestvideo[ext=webm]+bestaudio[ext=webm]/"
-                        "best[ext=webm]/"
-                        "bestvideo+bestaudio/best"
-                    )
-
-                else:
-
-                    format_selector = (
-                        "bestvideo+bestaudio/best"
-                    )
-
-            else:
-
-                height = int(
-                    quality.replace("p", "")
-                )
-
-                if output_format == "MP4":
-
-                    format_selector = (
-                        f"bestvideo[height<={height}][ext=mp4]+"
-                        f"bestaudio[ext=m4a]/"
-                        f"best[height<={height}][ext=mp4]/"
-                        f"bestvideo[height<={height}]+"
-                        f"bestaudio/"
-                        f"best[height<={height}]"
-                    )
-
-                elif output_format == "WEBM":
-
-                    format_selector = (
-                        f"bestvideo[height<={height}][ext=webm]+"
-                        f"bestaudio[ext=webm]/"
-                        f"best[height<={height}][ext=webm]/"
-                        f"bestvideo[height<={height}]+"
-                        f"bestaudio/"
-                        f"best[height<={height}]"
-                    )
-
-                else:
-
-                    format_selector = (
-                        f"bestvideo[height<={height}]+"
-                        f"bestaudio/"
-                        f"best[height<={height}]"
-                    )
-
-            ydl_opts = {
-                "format": format_selector,
-
-                "merge_output_format":
-                    output_format.lower(),
-
-                "outtmpl":
-                    output_template,
-
-                "noplaylist": True,
-
-                "quiet": True,
-
-                "no_warnings": True,
-
-                "restrictfilenames": False,
-
-                # Avoid leaving incomplete files
-                "continuedl": True,
-
-                # Don't keep temporary partial output
-                "keepvideo": False,
-            }
-
-        # ====================================================
-        # AUDIO
-        # ====================================================
-
+        # Optional cookies
+        cookies_path = None
+        if cookies_file is not None:
+            cookies_dir = tempfile.mkdtemp(prefix="yt_cookies_")
+            cookies_path = os.path.join(cookies_dir, "cookies.txt")
+            with open(cookies_path, "wb") as cf:
+                cf.write(cookies_file.getvalue())
         else:
+            cookies_dir = None
 
-            ydl_opts = {
+        def progress_hook(d):
+            try:
+                if d.get("status") == "downloading":
+                    total = d.get("total_bytes") or d.get(
+                        "total_bytes_estimate"
+                    )
+                    done = d.get("downloaded_bytes") or 0
+                    if total:
+                        progress.progress(
+                            min(85, max(1, int(done / total * 85)))
+                        )
+                elif d.get("status") == "finished":
+                    progress.progress(85)
+            except Exception:
+                pass
 
-                "format":
-                    "bestaudio/best",
+        status.info("Fetching media information...")
 
-                "outtmpl":
-                    output_template,
-
-                "noplaylist": True,
-
-                "quiet": True,
-
-                "no_warnings": True,
-
-                "restrictfilenames": False,
-
-                "postprocessors": [
-                    {
-                        "key":
-                            "FFmpegExtractAudio",
-
-                        "preferredcodec":
-                            audio_format.lower(),
-
-                        "preferredquality":
-                            "192",
-                    }
-                ],
-            }
-
-        # ====================================================
-        # DOWNLOAD
-        # ====================================================
-
-        status.info(
-            "Fetching media information..."
+        wanted_ext = (
+            "." + output_format.lower()
+            if media_type == "Video"
+            else "." + audio_format.lower()
         )
 
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        downloaded = None
+        last_error = None
 
-            info = ydl.extract_info(
-                url,
-                download=True,
+        for attempt, clients in enumerate(CLIENT_STRATEGIES, start=1):
+
+            clear_dir(temp_dir)
+
+            if attempt > 1:
+                status.info(
+                    f"Retrying with another method "
+                    f"({attempt}/{len(CLIENT_STRATEGIES)})..."
+                )
+                progress.progress(0)
+
+            ydl_opts = build_ydl_opts(
+                media_type=media_type,
+                quality=quality,
+                output_format=output_format,
+                audio_format=audio_format,
+                temp_dir=temp_dir,
+                ffmpeg_path=ffmpeg_path,
+                cookies_path=cookies_path,
+                clients=clients,
+                progress_hook=progress_hook,
             )
 
-        progress.progress(90)
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.extract_info(url.strip(), download=True)
 
-        status.info(
-            "Checking downloaded file..."
-        )
+                candidate = pick_output_file(temp_dir, wanted_ext)
 
-        # ====================================================
-        # FIND FINAL FILE
-        # ====================================================
+                if candidate is None:
+                    raise RuntimeError(
+                        "yt-dlp finished, but no output file was found."
+                    )
 
-        files = []
+                if candidate.stat().st_size < 1024:
+                    raise RuntimeError(
+                        f"The downloaded file is only "
+                        f"{candidate.stat().st_size} bytes."
+                    )
 
-        for p in Path(temp_dir).iterdir():
+                downloaded = candidate
+                break
 
-            if not p.is_file():
-                continue
+            except Exception as exc:
+                last_error = exc
+                msg = str(exc).lower()
 
-            # Ignore temporary yt-dlp files
-            if p.name.endswith(
-                (".part", ".ytdl", ".temp")
-            ):
-                continue
+                # Errors that another client cannot fix
+                if any(
+                    s in msg
+                    for s in (
+                        "unsupported url",
+                        "private video",
+                        "members-only",
+                        "video unavailable",
+                        "this video has been removed",
+                    )
+                ):
+                    break
 
-            files.append(p)
+        if downloaded is None:
+            raise last_error or RuntimeError("Download failed.")
 
-        if not files:
-
-            raise RuntimeError(
-                "yt-dlp finished, but no final output file "
-                "was found."
-            )
-
-        # ====================================================
-        # FIND VALID FILE
-        # ====================================================
-
-        valid_files = [
-            p for p in files
-            if p.stat().st_size > 0
-        ]
-
-        if not valid_files:
-
-            raise RuntimeError(
-                "The output file was created but is 0 bytes."
-            )
-
-        # Select largest valid file.
-        # This is safer than using modification time.
-        downloaded = max(
-            valid_files,
-            key=lambda p: p.stat().st_size
-        )
+        progress.progress(95)
+        status.info("Preparing file...")
 
         file_size = downloaded.stat().st_size
 
-        # ====================================================
-        # FINAL VALIDATION
-        # ====================================================
-
-        if file_size < 1024:
-
-            raise RuntimeError(
-                f"The downloaded file is only "
-                f"{file_size} bytes."
-            )
-
-        progress.progress(100)
-
-        status.success(
-            "Download completed."
-        )
-
-        # ====================================================
-        # MIME TYPE
-        # ====================================================
-
-        mime_types = {
-
-            ".mp4":
-                "video/mp4",
-
-            ".mkv":
-                "video/x-matroska",
-
-            ".webm":
-                "video/webm",
-
-            ".mp3":
-                "audio/mpeg",
-
-            ".m4a":
-                "audio/mp4",
-
-            ".wav":
-                "audio/wav",
-        }
-
-        mime = mime_types.get(
-            downloaded.suffix.lower(),
-            "application/octet-stream",
-        )
-
-        # ====================================================
-        # READ COMPLETE FILE
-        # ====================================================
-
-        with open(
-            downloaded,
-            "rb",
-        ) as f:
-
+        with open(downloaded, "rb") as f:
             data = f.read()
 
-        if not data:
-
-            raise RuntimeError(
-                "The output file could not be read."
-            )
-
         if len(data) != file_size:
+            raise RuntimeError("The file changed while being read.")
 
-            raise RuntimeError(
-                "The file changed while being read."
-            )
+        progress.progress(100)
+        status.success("Download completed.")
 
-        # ====================================================
-        # STREAMLIT DOWNLOAD
-        # ====================================================
-
-        st.download_button(
-
-            label=f"⬇ Save {downloaded.name}",
-
-            data=data,
-
-            file_name=downloaded.name,
-
-            mime=mime,
-
-            use_container_width=True,
-        )
-
-        st.caption(
-            f"File size: "
-            f"{file_size / (1024 * 1024):.2f} MB"
-        )
+        # Keep result in session state so the download button survives reruns
+        st.session_state["result"] = {
+            "name": downloaded.name,
+            "data": data,
+            "mime": MIME_TYPES.get(
+                downloaded.suffix.lower(), "application/octet-stream"
+            ),
+            "size": file_size,
+        }
 
     except Exception as exc:
 
-        st.error(
-            "Download failed."
-        )
+        st.error("Download failed.")
 
-        st.code(
-            str(exc)
-        )
+        nice = friendly_error(str(exc))
+
+        if nice:
+            st.warning(nice)
+
+        with st.expander("Technical details"):
+            st.code(str(exc))
 
     finally:
 
-        # Streamlit has already received the bytes
-        # through st.download_button.
-        shutil.rmtree(
-            temp_dir,
-            ignore_errors=True,
-        )
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+        try:
+            if cookies_dir:
+                shutil.rmtree(cookies_dir, ignore_errors=True)
+        except NameError:
+            pass
+
+
+# ============================================================
+# RESULT (persists after reruns)
+# ============================================================
+
+result = st.session_state.get("result")
+
+if result:
+
+    st.download_button(
+        label=f"⬇ Save {result['name']}",
+        data=result["data"],
+        file_name=result["name"],
+        mime=result["mime"],
+        use_container_width=True,
+    )
+
+    st.caption(f"File size: {result['size'] / (1024 * 1024):.2f} MB")
