@@ -1,10 +1,11 @@
 import os
 import shutil
+import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
 import streamlit as st
-import yt_dlp
 
 
 st.set_page_config(
@@ -12,6 +13,57 @@ st.set_page_config(
     page_icon="▶",
     layout="centered",
 )
+
+
+# ============================================================
+# LOAD THE NEWEST yt-dlp (nightly)
+# YouTube breaks yt-dlp often (e.g. the Aug 2026 android_vr 403 wave).
+# Fixes land in the nightly build first, so we install it once per
+# server start into a temp folder and import from there.
+# ============================================================
+
+NIGHTLY_DIR = Path(tempfile.gettempdir()) / "ytdlp_nightly"
+
+
+@st.cache_resource(show_spinner="Updating yt-dlp to the latest version...")
+def load_latest_ytdlp():
+    try:
+        marker = NIGHTLY_DIR / ".installed"
+
+        if not marker.exists():
+            NIGHTLY_DIR.mkdir(parents=True, exist_ok=True)
+
+            subprocess.run(
+                [
+                    sys.executable, "-m", "pip", "install",
+                    "--upgrade", "--pre", "--quiet",
+                    "--disable-pip-version-check",
+                    "--target", str(NIGHTLY_DIR),
+                    "yt-dlp[default]",
+                ],
+                check=True,
+                timeout=240,
+                capture_output=True,
+            )
+
+            marker.write_text("ok")
+
+        if str(NIGHTLY_DIR) not in sys.path:
+            sys.path.insert(0, str(NIGHTLY_DIR))
+
+        return True
+
+    except Exception:
+        # Fall back to the yt-dlp from requirements.txt
+        return False
+
+
+NIGHTLY_OK = load_latest_ytdlp()
+
+if NIGHTLY_OK and str(NIGHTLY_DIR) not in sys.path:
+    sys.path.insert(0, str(NIGHTLY_DIR))
+
+import yt_dlp  # noqa: E402
 
 # ============================================================
 # UI
@@ -178,11 +230,12 @@ MIME_TYPES = {
 # YouTube returns 403 for some player clients depending on the server IP
 # and the moment. We try several clients one after the other.
 CLIENT_STRATEGIES = [
-    None,                          # yt-dlp default
+    None,                          # yt-dlp default (nightly picks the best)
     ["tv", "web_safari"],
-    ["android_vr"],
-    ["ios"],
     ["mweb"],
+    ["web_safari"],
+    ["ios"],
+    ["android"],
 ]
 
 
@@ -359,8 +412,9 @@ def friendly_error(message):
         return (
             "YouTube refused the download (HTTP 403) with every method "
             "that was tried.\n\n"
-            "Fixes: reboot the app so the latest yt-dlp is installed, "
-            "or upload a cookies.txt file in the 'Advanced' section."
+            "Fixes: reboot the app (it re-installs the newest yt-dlp "
+            "on start), or upload a cookies.txt file in the 'Advanced' "
+            "section."
         )
 
     if "private video" in low or "members-only" in low:
@@ -442,6 +496,10 @@ else:
     )
 
 with st.expander("Advanced (optional)"):
+    st.caption(
+        f"yt-dlp version: {yt_dlp.version.__version__} "
+        f"({'nightly' if NIGHTLY_OK else 'from requirements.txt'})"
+    )
     cookies_file = st.file_uploader(
         "cookies.txt (Netscape format)",
         type=["txt"],
