@@ -1,3 +1,0 @@
-# Packages required by the app
-streamlit
-yt-dlp
